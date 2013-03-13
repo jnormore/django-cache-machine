@@ -104,7 +104,7 @@ class CacheMachine(object):
         cached = self.invalidator.cache.get(query_key)
         if cached is not None:
             if self.invalidator and self.invalidator.cache_name:
-                log.debug('cache hit (%s)'%(self.invalidator.cache_name, self.query_string))
+                log.debug('cache hit (%s): %s'%(self.invalidator.cache_name, self.query_string))
             else:
                 log.debug('cache hit: %s' % self.query_string)
             for obj in cached:

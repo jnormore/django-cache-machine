@@ -11,7 +11,7 @@ from test_utils import ExtraAppTestCase
 import caching.base as caching
 from caching import invalidation
 
-from testapp.models import Addon, User
+from testapp.models import Addon, User, LocalAddon
 
 
 class CachingTestCase(ExtraAppTestCase):
@@ -43,6 +43,11 @@ class CachingTestCase(ExtraAppTestCase):
         """Basic cache test: second get comes from cache."""
         assert Addon.objects.get(id=1).from_cache is False
         assert Addon.objects.get(id=1).from_cache is True
+
+    def test_cache_different_cache(self):
+        """Test that non default cache can be used."""
+        assert LocalAddon.objects.invalidator.cache_name == 'local'
+        assert LocalAddon.objects.filter(id=1).invalidator.cache_name == 'local'
 
     def test_filter_cache(self):
         assert Addon.objects.filter(id=1)[0].from_cache is False
@@ -382,7 +387,7 @@ class CachingTestCase(ExtraAppTestCase):
         eq_(q.get().id, 1)
         assert hasattr(q.get(), 'from_cache')
 
-    @mock.patch('caching.base.cache')
+    @mock.patch('caching.invalidation.cache')
     def test_cache_machine_timeout(self, cache):
         cache.scheme = 'memcached'
         cache.get.return_value = None

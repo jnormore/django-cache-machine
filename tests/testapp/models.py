@@ -27,3 +27,10 @@ class Addon(CachingMixin, models.Model):
         """This is a docstring for calls()"""
         call_counter()
         return arg, call_counter.call_count
+
+class LocalAddon(CachingMixin, models.Model):
+    val = models.IntegerField()
+    author1 = models.ForeignKey(User)
+    author2 = models.ForeignKey(User, related_name='local_addon_author2_set')
+
+    objects = CachingManager(cache_name='local')

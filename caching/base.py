@@ -8,7 +8,7 @@ from django.db.models import signals
 from django.db.models.sql import query
 from django.utils import encoding
 
-from .invalidation import invalidator, flush_key, make_key, byid
+from .invalidation import invalidator, flush_key, make_key, byid, get_invalidator
 
 
 class NullHandler(logging.Handler):
@@ -29,11 +29,16 @@ CACHE_EMPTY_QUERYSETS = getattr(settings, 'CACHE_EMPTY_QUERYSETS', False)
 
 class CachingManager(models.Manager):
 
+    def __init__(self, *args, **kwargs):
+        self.cache_name = kwargs.pop('cache_name', None)
+        self.invalidator = get_invalidator(cache_name=self.cache_name)
+        super(CachingManager, self).__init__(*args, **kwargs)
+
     # Tell Django to use this manager when resolving foreign keys.
     use_for_related_fields = True
 
     def get_query_set(self):
-        return CachingQuerySet(self.model)
+        return CachingQuerySet(self.model, invalidator=self.invalidator)
 
     def contribute_to_class(self, cls, name):
         signals.post_save.connect(self.post_save, sender=cls)
@@ -49,11 +54,11 @@ class CachingManager(models.Manager):
     def invalidate(self, *objects):
         """Invalidate all the flush lists associated with ``objects``."""
         keys = [k for o in objects for k in o._cache_keys()]
-        invalidator.invalidate_keys(keys)
+        self.invalidator.invalidate_keys(keys)
 
     def raw(self, raw_query, params=None, *args, **kwargs):
         return CachingRawQuerySet(raw_query, self.model, params=params,
-                                  using=self._db, *args, **kwargs)
+                                  using=self._db, invalidator=invalidator, *args, **kwargs)
 
     def cache(self, timeout=None):
         return self.get_query_set().cache(timeout)
@@ -70,11 +75,12 @@ class CacheMachine(object):
     called to get an iterator over some database results.
     """
 
-    def __init__(self, query_string, iter_function, timeout=None, db='default'):
+    def __init__(self, query_string, iter_function, timeout=None, db='default', invalidator=None):
         self.query_string = query_string
         self.iter_function = iter_function
         self.timeout = timeout
         self.db = db
+        self.invalidator = invalidator
 
     def query_key(self):
         """
@@ -95,9 +101,12 @@ class CacheMachine(object):
             raise StopIteration
 
         # Try to fetch from the cache.
-        cached = cache.get(query_key)
+        cached = self.invalidator.cache.get(query_key)
         if cached is not None:
-            log.debug('cache hit: %s' % self.query_string)
+            if self.invalidator and self.invalidator.cache_name:
+                log.debug('cache hit (%s)'%(self.invalidator.cache_name, self.query_string))
+            else:
+                log.debug('cache hit: %s' % self.query_string)
             for obj in cached:
                 obj.from_cache = True
                 yield obj
@@ -122,13 +131,14 @@ class CacheMachine(object):
         """Cache query_key => objects, then update the flush lists."""
         query_key = self.query_key()
         query_flush = flush_key(self.query_string)
-        cache.add(query_key, objects, timeout=self.timeout)
-        invalidator.cache_objects(objects, query_key, query_flush)
+        self.invalidator.cache.add(query_key, objects, timeout=self.timeout)
+        self.invalidator.cache_objects(objects, query_key, query_flush)
 
 
 class CachingQuerySet(models.query.QuerySet):
 
     def __init__(self, *args, **kw):
+        self.invalidator = kw.pop('invalidator', invalidator)
         super(CachingQuerySet, self).__init__(*args, **kw)
         self.timeout = None
 
@@ -151,7 +161,7 @@ class CachingQuerySet(models.query.QuerySet):
                 return iterator()
             if FETCH_BY_ID:
                 iterator = self.fetch_by_id
-            return iter(CacheMachine(query_string, iterator, self.timeout, db=self.db))
+            return iter(CacheMachine(query_string, iterator, self.timeout, db=self.db, invalidator=self.invalidator))
 
     def fetch_by_id(self):
         """
@@ -167,7 +177,7 @@ class CachingQuerySet(models.query.QuerySet):
         vals = self.values_list('pk', *self.query.extra.keys())
         pks = [val[0] for val in vals]
         keys = dict((byid(self.model._cache_key(pk)), pk) for pk in pks)
-        cached = dict((k, v) for k, v in cache.get_many(keys).items()
+        cached = dict((k, v) for k, v in self.invalidator.cache.get_many(keys).items()
                       if v is not None)
 
         # Pick up the objects we missed.
@@ -176,7 +186,7 @@ class CachingQuerySet(models.query.QuerySet):
             others = self.fetch_missed(missed)
             # Put the fetched objects back in cache.
             new = dict((byid(o), o) for o in others)
-            cache.set_many(new)
+            self.invalidator.cache.set_many(new)
         else:
             new = {}
 
@@ -209,6 +219,7 @@ class CachingQuerySet(models.query.QuerySet):
     def cache(self, timeout=None):
         qs = self._clone()
         qs.timeout = timeout
+        qs.invalidator = self.invalidator
         return qs
 
     def no_cache(self):
@@ -217,6 +228,7 @@ class CachingQuerySet(models.query.QuerySet):
     def _clone(self, *args, **kw):
         qs = super(CachingQuerySet, self)._clone(*args, **kw)
         qs.timeout = self.timeout
+        qs.invalidator = self.invalidator
         return qs
 
 
@@ -253,10 +265,14 @@ class CachingMixin:
 
 class CachingRawQuerySet(models.query.RawQuerySet):
 
+    def __init__(self, *args, **kw):
+        self.invalidator = kw.pop('invalidator', invalidator)
+        super(CachingRawQuerySet, self).__init__(*args, **kw)
+
     def __iter__(self):
         iterator = super(CachingRawQuerySet, self).__iter__
         sql = self.raw_query % tuple(self.params)
-        for obj in CacheMachine(sql, iterator):
+        for obj in CacheMachine(sql, iterator, invalidator=invalidator):
             yield obj
         raise StopIteration
 

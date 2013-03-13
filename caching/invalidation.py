@@ -5,7 +5,7 @@ import logging
 import socket
 
 from django.conf import settings
-from django.core.cache import cache, parse_backend_uri
+from django.core.cache import cache, parse_backend_uri, get_cache
 from django.utils import encoding, translation
 
 try:
@@ -67,6 +67,13 @@ def safe_redis(return_type):
 
 class Invalidator(object):
 
+    def __init__(self, cache_name=None):
+        self.cache_name = cache_name
+
+    @property
+    def cache(self):
+        return get_cache(self.cache_name) if self.cache_name else cache
+
     def invalidate_keys(self, keys):
         """Invalidate all the flush lists named by the list of ``keys``."""
         if not keys:
@@ -74,7 +81,7 @@ class Invalidator(object):
         flush, flush_keys = self.find_flush_lists(keys)
 
         if flush:
-            cache.set_many(dict((k, None) for k in flush), 5)
+            self.cache.set_many(dict((k, None) for k in flush), 5)
         if flush_keys:
             self.clear_flush_lists(flush_keys)
 
@@ -124,23 +131,23 @@ class Invalidator(object):
     def add_to_flush_list(self, mapping):
         """Update flush lists with the {flush_key: [query_key,...]} map."""
         flush_lists = collections.defaultdict(set)
-        flush_lists.update(cache.get_many(mapping.keys()))
+        flush_lists.update(self.cache.get_many(mapping.keys()))
         for key, list_ in mapping.items():
             if flush_lists[key] is None:
                 flush_lists[key] = set(list_)
             else:
                 flush_lists[key].update(list_)
-        cache.set_many(flush_lists)
+        self.cache.set_many(flush_lists)
 
     def get_flush_lists(self, keys):
         """Return a set of object keys from the lists in `keys`."""
         return set(e for flush_list in
-                   filter(None, cache.get_many(keys).values())
+                   filter(None, self.cache.get_many(keys).values())
                    for e in flush_list)
 
     def clear_flush_lists(self, keys):
         """Remove the given keys from the database."""
-        cache.delete_many(keys)
+        self.cache.delete_many(keys)
 
 
 class RedisInvalidator(Invalidator):
@@ -201,11 +208,14 @@ def get_redis_backend():
     return redislib.Redis(host=host, port=port, db=db, password=password,
                           socket_timeout=socket_timeout)
 
+def get_invalidator(cache_name=None):
+    if getattr(settings, 'CACHE_MACHINE_NO_INVALIDATION', False):
+        return NullInvalidator(cache_name=cache_name)
+    elif getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
+        return RedisInvalidator(cache_name=cache_name)
+    else:
+        return Invalidator(cache_name=cache_name)
 
-if getattr(settings, 'CACHE_MACHINE_NO_INVALIDATION', False):
-    invalidator = NullInvalidator()
-elif getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
+if getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
     redis = get_redis_backend()
-    invalidator = RedisInvalidator()
-else:
-    invalidator = Invalidator()
+invalidator = get_invalidator()

@@ -5,13 +5,20 @@ import logging
 import socket
 
 from django.conf import settings
-from django.core.cache import cache, parse_backend_uri, get_cache
+from django.core.cache import cache as default_cache, get_cache, parse_backend_uri
+from django.core.cache.backends.base import InvalidCacheBackendError
 from django.utils import encoding, translation
 
 try:
     import redis as redislib
 except ImportError:
     redislib = None
+
+# Look for an own cache first before falling back to the default cache
+try:
+    cache = get_cache('cache_machine')
+except (InvalidCacheBackendError, ValueError):
+    cache = default_cache
 
 
 CACHE_PREFIX = getattr(settings, 'CACHE_PREFIX', '')
@@ -38,7 +45,7 @@ def flush_key(obj):
 
 
 def byid(obj):
-    key = obj if isinstance(obj, basestring) else obj._cache_key(obj.pk)
+    key = obj if isinstance(obj, basestring) else obj.cache_key
     return make_key('byid:' + key)
 
 
@@ -64,7 +71,6 @@ def safe_redis(return_type):
     return decorator
 
 
-
 class Invalidator(object):
 
     def __init__(self, cache_name=None):
@@ -81,7 +87,7 @@ class Invalidator(object):
         flush, flush_keys = self.find_flush_lists(keys)
 
         if flush:
-            self.cache.set_many(dict((k, None) for k in flush), 5)
+            self.cache.delete_many(flush)
         if flush_keys:
             self.clear_flush_lists(flush_keys)
 

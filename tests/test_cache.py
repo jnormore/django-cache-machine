@@ -1,31 +1,49 @@
 # -*- coding: utf-8 -*-
+import django
 from django.conf import settings
-from django.core.cache import cache
+from django.test import TestCase
 from django.utils import translation, encoding
 
 import jinja2
 import mock
 from nose.tools import eq_
 
-from test_utils import ExtraAppTestCase
 import caching.base as caching
 from caching import invalidation
 
 from testapp.models import Addon, User, LocalAddon
+cache = invalidation.cache
+
+if django.get_version().startswith('1.3'):
+    class settings_patch(object):
+        def __init__(self, **kwargs):
+            self.options = kwargs
+
+        def __enter__(self):
+            self._old_settings = dict((k, getattr(settings, k, None)) for k in self.options)
+            for k, v in self.options.items():
+                setattr(settings, k, v)
+
+        def __exit__(self, *args):
+            for k in self.options:
+                setattr(settings, k, self._old_settings[k])
+
+    TestCase.settings = settings_patch
 
 
-class CachingTestCase(ExtraAppTestCase):
+class CachingTestCase(TestCase):
+    multi_db = True
     fixtures = ['testapp/test_cache.json']
     extra_apps = ['tests.testapp']
 
     def setUp(self):
         cache.clear()
-        self.old_timeout = getattr(settings, 'CACHE_COUNT_TIMEOUT', None)
+        self.old_timeout = caching.TIMEOUT
         if getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
             invalidation.redis.flushall()
 
     def tearDown(self):
-        settings.CACHE_COUNT_TIMEOUT = self.old_timeout
+        caching.TIMEOUT = self.old_timeout
 
     def test_flush_key(self):
         """flush_key should work for objects or strings."""
@@ -34,7 +52,7 @@ class CachingTestCase(ExtraAppTestCase):
 
     def test_cache_key(self):
         a = Addon.objects.get(id=1)
-        eq_(a.cache_key, 'o:testapp.addon:1')
+        eq_(a.cache_key, 'o:testapp.addon:1:default')
 
         keys = set((a.cache_key, a.author1.cache_key, a.author2.cache_key))
         eq_(set(a._cache_keys()), keys)
@@ -71,6 +89,10 @@ class CachingTestCase(ExtraAppTestCase):
         a = [x for x in Addon.objects.all() if x.id == 1][0]
         assert a.from_cache is False
 
+        assert Addon.objects.get(id=1).from_cache is True
+        a = [x for x in Addon.objects.all() if x.id == 1][0]
+        assert a.from_cache is True
+
     def test_invalidation_cross_locale(self):
         assert Addon.objects.get(id=1).from_cache is False
         a = [x for x in Addon.objects.all() if x.id == 1][0]
@@ -88,9 +110,6 @@ class CachingTestCase(ExtraAppTestCase):
         assert a.from_cache is True
 
         a.save()
-        assert Addon.objects.get(id=1).from_cache is False
-        a = [x for x in Addon.objects.all() if x.id == 1][0]
-        assert a.from_cache is False
 
         translation.activate(old_locale)
         assert Addon.objects.get(id=1).from_cache is False
@@ -150,7 +169,7 @@ class CachingTestCase(ExtraAppTestCase):
 
     @mock.patch('caching.base.cache')
     def test_count_cache(self, cache_mock):
-        settings.CACHE_COUNT_TIMEOUT = 60
+        caching.TIMEOUT = 60
         cache_mock.scheme = 'memcached'
         cache_mock.get.return_value = None
 
@@ -164,13 +183,13 @@ class CachingTestCase(ExtraAppTestCase):
 
     @mock.patch('caching.base.cached')
     def test_count_none_timeout(self, cached_mock):
-        settings.CACHE_COUNT_TIMEOUT = None
+        caching.TIMEOUT = None
         Addon.objects.count()
         eq_(cached_mock.call_count, 0)
 
     @mock.patch('caching.base.cached')
     def test_count_nocache(self, cached_mock):
-        settings.CACHE_COUNT_TIMEOUT = 60
+        caching.TIMEOUT = 60
         Addon.objects.no_cache().count()
         eq_(cached_mock.call_count, 0)
 
@@ -443,3 +462,24 @@ class CachingTestCase(ExtraAppTestCase):
         if not getattr(settings, 'CACHE_MACHINE_USE_REDIS', False):
             cache_mock.return_value.values.return_value = [None, [1]]
             eq_(caching.invalidator.get_flush_lists(None), set([1]))
+
+    def test_multidb_cache(self):
+        """ Test where master and slave DB result in two different cache keys """
+        assert Addon.objects.get(id=1).from_cache is False
+        assert Addon.objects.get(id=1).from_cache is True
+
+        from_slave = Addon.objects.using('slave').get(id=1)
+        assert from_slave.from_cache is False
+        assert from_slave._state.db == 'slave'
+
+    def test_multidb_fetch_by_id(self):
+        """ Test where master and slave DB result in two different cache keys with FETCH_BY_ID"""
+        with self.settings(FETCH_BY_ID=True):
+            assert Addon.objects.get(id=1).from_cache is False
+            assert Addon.objects.get(id=1).from_cache is True
+
+            from_slave = Addon.objects.using('slave').get(id=1)
+            assert from_slave.from_cache is False
+            assert from_slave._state.db == 'slave'
+
+

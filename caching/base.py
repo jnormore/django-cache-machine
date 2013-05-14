@@ -2,13 +2,12 @@ import functools
 import logging
 
 from django.conf import settings
-from django.core.cache import cache
 from django.db import models
 from django.db.models import signals
 from django.db.models.sql import query
 from django.utils import encoding
 
-from .invalidation import invalidator, flush_key, make_key, byid, get_invalidator
+from .invalidation import invalidator, flush_key, make_key, byid, cache, get_invalidator
 
 
 class NullHandler(logging.Handler):
@@ -25,6 +24,7 @@ NO_CACHE = -1
 CACHE_PREFIX = getattr(settings, 'CACHE_PREFIX', '')
 FETCH_BY_ID = getattr(settings, 'FETCH_BY_ID', False)
 CACHE_EMPTY_QUERYSETS = getattr(settings, 'CACHE_EMPTY_QUERYSETS', False)
+TIMEOUT = getattr(settings, 'CACHE_COUNT_TIMEOUT', None)
 
 
 class CachingManager(models.Manager):
@@ -38,7 +38,7 @@ class CachingManager(models.Manager):
     use_for_related_fields = True
 
     def get_query_set(self):
-        return CachingQuerySet(self.model, invalidator=self.invalidator)
+        return CachingQuerySet(self.model, invalidator=self.invalidator, using=self._db)
 
     def contribute_to_class(self, cls, name):
         signals.post_save.connect(self.post_save, sender=cls)
@@ -144,6 +144,7 @@ class CachingQuerySet(models.query.QuerySet):
 
     def flush_key(self):
         return flush_key(self.query_key())
+
     def query_key(self):
         clone = self.query.clone()
         sql, params = clone.get_compiler(using=self.db).as_sql()
@@ -176,7 +177,7 @@ class CachingQuerySet(models.query.QuerySet):
         # order_by.
         vals = self.values_list('pk', *self.query.extra.keys())
         pks = [val[0] for val in vals]
-        keys = dict((byid(self.model._cache_key(pk)), pk) for pk in pks)
+        keys = dict((byid(self.model._cache_key(pk, self.db)), pk) for pk in pks)
         cached = dict((k, v) for k, v in self.invalidator.cache.get_many(keys).items()
                       if v is not None)
 
@@ -208,13 +209,12 @@ class CachingQuerySet(models.query.QuerySet):
         return others
 
     def count(self):
-        timeout = getattr(settings, 'CACHE_COUNT_TIMEOUT', None)
         super_count = super(CachingQuerySet, self).count
         query_string = 'count:%s' % self.query_key()
-        if self.timeout == NO_CACHE or timeout is None:
+        if self.timeout == NO_CACHE or TIMEOUT is None:
             return super_count()
         else:
-            return cached_with(self, super_count, query_string, timeout)
+            return cached_with(self, super_count, query_string, TIMEOUT)
 
     def cache(self, timeout=None):
         qs = self._clone()
@@ -232,7 +232,7 @@ class CachingQuerySet(models.query.QuerySet):
         return qs
 
 
-class CachingMixin:
+class CachingMixin(object):
     """Inherit from this class to get caching and invalidation helpers."""
 
     def flush_key(self):
@@ -241,16 +241,16 @@ class CachingMixin:
     @property
     def cache_key(self):
         """Return a cache key based on the object's primary key."""
-        return self._cache_key(self.pk)
+        return self._cache_key(self.pk, self._state.db)
 
     @classmethod
-    def _cache_key(cls, pk):
+    def _cache_key(cls, pk, db):
         """
         Return a string that uniquely identifies the object.
 
         For the Addon class, with a pk of 2, we get "o:addons.addon:2".
         """
-        key_parts = ('o', cls._meta, pk)
+        key_parts = ('o', cls._meta, pk, db)
         return ':'.join(map(encoding.smart_unicode, key_parts))
 
     def _cache_keys(self):
@@ -258,7 +258,7 @@ class CachingMixin:
         fks = dict((f, getattr(self, f.attname)) for f in self._meta.fields
                     if isinstance(f, models.ForeignKey))
 
-        keys = [fk.rel.to._cache_key(val) for fk, val in fks.items()
+        keys = [fk.rel.to._cache_key(val, self._state.db) for fk, val in fks.items()
                 if val is not None and hasattr(fk.rel.to, '_cache_key')]
         return (self.cache_key,) + tuple(keys)
 

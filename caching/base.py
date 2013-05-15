@@ -267,14 +267,20 @@ class CachingRawQuerySet(models.query.RawQuerySet):
 
     def __init__(self, *args, **kw):
         self.invalidator = kw.pop('invalidator', invalidator)
+        timeout = kw.pop('timeout', None)
         super(CachingRawQuerySet, self).__init__(*args, **kw)
+        self.timeout = timeout
 
     def __iter__(self):
         iterator = super(CachingRawQuerySet, self).__iter__
-        sql = self.raw_query % tuple(self.params)
-        for obj in CacheMachine(sql, iterator, invalidator=invalidator):
-            yield obj
-        raise StopIteration
+        if self.timeout == NO_CACHE:
+            iterator = iterator()
+            while True: yield iterator.next()
+        else:
+            sql = self.raw_query % tuple(self.params)
+            for obj in CacheMachine(sql, iterator, timeout=self.timeout, invalidator=invalidator):
+                yield obj
+            raise StopIteration
 
 
 def _function_cache_key(key):
